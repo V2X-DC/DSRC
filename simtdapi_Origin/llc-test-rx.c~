@@ -1,0 +1,875 @@
+/**
+ * @addtogroup cohda_llc_intern_app LLC application
+ * @{
+ *
+ * @section cohda_llc_intern_app_dbg LLC 'chconfig' plugin command
+ *
+ * @verbatim
+    MKx test rx
+    Usage: llc test-rx 
+   @endverbatim
+ *
+ * @file
+ * LLC: 'cw-llc' monitoring application ('test-rx' command support)
+ *
+ */
+
+//------------------------------------------------------------------------------
+// Copyright (c) 2015 Cohda Wireless Pty Ltd
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// Included headers
+//------------------------------------------------------------------------------
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <signal.h>
+#include <poll.h>
+#include <math.h>
+#include <stdbool.h>
+#include <arpa/inet.h>
+#include <time.h>
+#include <sys/time.h>
+
+#include "linux/cohda/pktbuf.h"
+#include "linux/cohda/llc/llc.h"
+#include "linux/cohda/llc/llc-api.h"
+#include "dot4-internal.h"
+#include "mk2mac-api-types.h"
+#include "test-common.h"
+#include "llc-plugin.h"
+#include "debug-levels.h"
+#include "RxOpts.h"
+#include "RxStats.h"
+
+//------------------------------------------------------------------------------
+// Macros & Constants
+//------------------------------------------------------------------------------
+#define MAX_PATH (512)
+#define RXMATCHEDSTRING "M"
+#define RXUNMATCHEDSTRING "U"
+#define HISTOGRAM_BIN_SIZE_USEC 5000
+
+/// Amount of space to reserve for stack headers at the front of the PktBuf
+#define LLC_ALLOC_EXTRA_HEADER (56)
+/// Amount of space to reserve for stack footers at the end of the PktBuf
+#define LLC_ALLOC_EXTRA_FOOTER (16)
+
+uint32_t RxRecvLengethByte, LastRxRecvLengthByte;//用于计算每一秒接收的真正的数据数量，802.11 Header + Body, not including FCS
+//------------------------------------------------------------------------------
+// Type definitions
+//------------------------------------------------------------------------------
+
+/// Application/command state structure
+typedef struct LLCRx
+{
+  /// Command line agruments
+  struct
+  {
+    int Argc;
+    char **ppArgv;
+  } Args;
+  uint32_t SeqNum;
+  tRxOpts RxOpts;
+  /// MKx handle
+  struct MKx *pMKx;
+  /// MKx file descriptor
+  int Fd;
+  /// Exit flag
+  bool Exit;
+  FILE *fp;
+  FILE *fpr;
+  // Message count
+  int Cnt;
+  /// Ethernet header (for preloading invariants)
+  struct ethhdr EthHdr;
+// used to exit gracefully on ctrl-c
+  bool RxContinue;
+  /// Object to enable open loop performance analysis
+  tRxStats *pRxStats;
+} tLLCRx;
+
+//------------------------------------------------------------------------------
+// Function Prototypes
+//------------------------------------------------------------------------------
+
+static int LLC_RxCmd (struct PluginCmd *pCmd, int Argc, char **ppArgv);
+static int LLC_RxMain (int Argc, char **ppArgv);
+
+//------------------------------------------------------------------------------
+// Variables
+//------------------------------------------------------------------------------
+
+/// Plugin support structure(s)
+struct PluginCmd RxCmd =
+{
+  .pName = "test-rx",
+  .pHelp = (
+    "usage: test-rx <Options>\n"
+    "-f, --LogFile\n"
+    "        Packet Log File Name\n"
+    "        string\n"
+    "-r, --ReportFile\n"
+    "        Report File Name\n"
+    "        string\n"
+    "-h, --Help|Usage\n"
+    "        Print this Usage\n"
+    "-u, --LogUnMatched\n"
+    "        Log Unmatched Packets\n"
+    "-p, --ReportPeriod\n"
+    "        Report to Standard output after this many packets\n"
+    "        uint16\n"
+    "-y, --DumpPayload\n"
+    "        Dump Packet Payload in addition to Descriptor\n"
+    "-o, --DumpToStdout\n"
+    "        Dump packets to Standard output\n"
+    "-s, --StatSA\n"
+    "        Statistics on this MAC Source Address only\n"
+    "        aa:bb:cc:dd:ee:ff\n"
+    "-i, --Interface\n"
+    "        Network interface to receive on\n"
+    "        wave-raw | wave-mgmt\n"
+    "-c, --ChannelNumber\n"
+    "        Rx on this Channel Number\n"
+    "        uint8\n"
+    "-l, --LatencyResults\n"
+    "        Give latency calculation results\n"
+    "        uint8\n"),
+  .Func = LLC_RxCmd,
+};
+
+/// App/command state
+static struct LLCRx _Dev =
+{
+  .pMKx = NULL,
+  .Exit = false,
+};
+static struct LLCRx *pDev = &(_Dev);
+
+
+//------------------------------------------------------------------------------
+// Functions definitions
+//------------------------------------------------------------------------------
+
+/**
+ * @brief Called by the llc app when the 'dbg' command is specified
+ */
+static int LLC_RxCmd (struct PluginCmd *pCmd,
+                       int Argc,
+                       char **ppArgv)
+{
+  int Res;
+
+  d_printf(D_DBG, NULL, "Argc=%d, ppArgv[0]=%s\n", Argc, ppArgv[0]);
+
+  Res = LLC_RxMain(Argc, ppArgv);
+  if (Res < 0)
+    d_printf(D_WARN, NULL, "%d (%s)\n", Res, strerror(-Res));
+
+  return Res;
+}
+
+/**
+ * @brief Print capture specific usage info
+ */
+static int LLC_RxUsage (void)
+{
+  Plugin_CmdPrintUsage(&RxCmd);
+  return -EINVAL;
+}
+
+/**
+ * @brief Signal Handler
+ * @param SigNum the signal caught
+ *
+ * Set the exit flag so that application can exit following next
+ * main loop iteration.
+ *
+ */
+static void LLC_RxSignal (int SigNum)
+{
+  d_printf(D_TST, NULL, "Signal %d!\n", SigNum);
+
+  pDev->RxContinue = false;
+  // Break the MKx_Recv() loops
+  (void)MKx_Recv(NULL);
+}
+
+/**
+ * @brief match two MAC addresses
+ * @param AddrA a MAC Address
+ * @param AddrB a MAC Address
+ * @return boolean
+ * Received buffer handle is owned by tRx object
+ */
+static bool MatchMACAddr (const uint8_t * pAddrA, const uint8_t * pAddrB)
+{
+  bool Matched = true; // and with each byte check
+  int b; // Byte index
+
+  for (b = 0; b < 6; b++)
+    Matched = Matched && (pAddrA[b] == pAddrB[b]);
+
+  d_printf(D_DEBUG, NULL, "Matched %d\n", Matched);
+  return Matched;
+}
+
+/**
+ * @brief Does this packet match our Stat criteria
+ * @param pRxSrcAddr the Source address of the candidate
+ * @param RxEtherType the EtherType of the candidate
+ * @param ChannelNumber the channel number of the candidate
+ * @param pRxOpts contains matching criteria
+ *
+ */
+static bool Rx_Match (const uint8_t *pRxSrcAddr,
+                      uint8_t ChannelNumber,
+                      tRxOpts * pRxOpts)
+{
+  bool Matched = true; // Assume Match then disprove
+
+  d_fnstart(D_DEBUG, NULL, "(pRxSrcAddr %p, pRxOpts %p)\n", pRxSrcAddr, pRxOpts);
+  d_assert(pRxSrcAddr != NULL);
+  d_assert(pRxOpts != NULL);
+
+  d_printf(D_DEBUG, NULL, "pRxOpts->StatSAFilt %d\n", pRxOpts->StatSAFilt);
+  d_printf(D_DEBUG, NULL, "Matched %d (%d, %d)\n", Matched, true, false);
+
+  // Match on Source Address
+  if (pRxOpts->StatSAFilt)
+    Matched = Matched && MatchMACAddr(pRxSrcAddr,
+                                      (uint8_t *) &(pRxOpts->StatSA));
+
+  // Match on Channel Number
+  d_printf(D_DEBUG, NULL, "Matched %d (ChannelNumber %d, %d)\n", Matched,
+           ChannelNumber, pRxOpts->ChannelNumber);
+
+  Matched = Matched && (ChannelNumber == pRxOpts->ChannelNumber);
+
+  d_fnend(D_DEBUG, NULL, "(pRxSrcAddr %p, pRxOpts %p) = %d\n", pRxSrcAddr,
+          pRxOpts, Matched);
+
+  return Matched;
+}
+
+static tRxErrCode Rx_LLCHeader_fprintf (FILE * fp,
+                                        struct MKxRxPacketData *pPacket,
+                                        unsigned char ChannelNumber,
+                                        int Latency)
+{
+  uint64_t RxTSF_Seconds, RxTSF_uSeconds;
+  struct IEEE80211QoSHeader *pMAC = (struct IEEE80211QoSHeader *)pPacket->RxFrame;
+
+  if (fp == NULL)
+  {
+    fprintf(stderr, "invalid file handle\n");
+    return -1;
+  }
+  else
+  {
+    if (pPacket == NULL)
+    {
+      /// Indicate the channel number that frame was received on
+      fprintf(fp, "%3s ", "ChN");
+      /// Indicate the priority allocated to the received packet (by Tx)
+      fprintf(fp, "%3s ", "Pri");
+      /// Indicate the 802.11 service class used to transmit the packet
+      fprintf(fp, "%3s ", "Srv");
+      /// Indicate the data rate that was used
+      fprintf(fp, "%2s ", "MC");
+      /// Indicate the received power on Antenna A
+      fprintf(fp, "%7s ", "PowerA");
+      /// Indicate the received power on Antenna B
+      fprintf(fp, "%7s ", "PowerB");
+      /// Indicate the receiver noise on Antenna A
+      fprintf(fp, "%7s ", "NoiseA");
+      /// Indicate the receiver noise on Antenna B
+      fprintf(fp, "%7s ", "NoiseB");
+      /// MAC Rx Timestamp, local MAC TSF time at which packet was received.
+      fprintf(fp, "%21s ", "Time Stamp (s)");
+      if (Latency != 0)
+        fprintf(fp, "%8s ", "Lat (us)");
+    }
+    else
+    {
+      /// Indicate the channel number that frame was received on
+      fprintf(fp, "%03d ", ChannelNumber);
+      /// Indicate the priority allocated to the received packet (by Tx)
+      fprintf(fp, "%03d ", (unsigned char) pMAC->QoSControl.Fields.TID);
+      /// Indicate the 802.11 service class used to transmit the packet
+      fprintf(fp, "%03d ", (unsigned char) pMAC->QoSControl.Fields.AckPolicy);
+      /// Indicate the data rate that was used
+      fprintf(fp, "%02d ", (unsigned char) pPacket->MCS);
+      /// Indicate the received power on Antenna A
+      fprintf(fp, "%7.1f ", 0.5 * pPacket->RxPowerA);
+      /// Indicate the received power on Antenna B
+      fprintf(fp, "%7.1f ", 0.5 * pPacket->RxPowerB);
+      /// Indicate the receiver noise on Antenna A
+      fprintf(fp, "%7.1f ", 0.5 * pPacket->RxNoiseA);
+      /// Indicate the receiver noise on Antenna B
+      fprintf(fp, "%7.1f ", 0.5 * pPacket->RxNoiseB);
+      /// MAC Rx Timestamp, local MAC TSF time at which packet was received.
+      RxTSF_Seconds = pPacket->RxTSF / 1000000;
+      RxTSF_uSeconds = pPacket->RxTSF % 1000000;
+      fprintf(fp, "%014llu.", RxTSF_Seconds);
+      fprintf(fp, "%06llu ", RxTSF_uSeconds);
+      if (Latency != 0)
+        fprintf(fp, "%08d ", Latency);
+    }
+    return 0;
+  }
+}
+
+/**
+ * @brief Write the info in packet Buffer to Packet log
+ * @param fp File Pointer (open)
+ * @param pBuf the Buffer containing the Frame to be logged
+ * @param FrameLen the number of relevant Bytes in the Buffer
+ * @param DumpPayload Should the entire payload be dumped to file
+ * @param DumpHeadings dump headings in addition to data?
+ * @return Error Code
+ *
+ * Buffer includes RxDescriptor, Ethernet header, Payload and FCS
+ *
+ */
+static tRxErrCode Rx_fprintf_waveraw (FILE * fp,
+                                      unsigned char * pBuf,
+                                      int FrameLen,
+                                      unsigned char ChannelNumber,
+                                      bool DumpPayload,
+                                      bool Matched,
+                                      bool DumpHeadings,
+                                      int PayloadErrors,
+                                      int Latency)
+{
+  tRxErrCode ErrCode = TX_ERR_NONE;
+  struct MKxRxPacketData *pPacket = (struct MKxRxPacketData *)pBuf;
+  struct IEEE80211QoSHeader *pMAC = (struct IEEE80211QoSHeader *)pPacket->RxFrame;
+  struct SNAPHeader *pSNAP = (struct SNAPHeader *)(pMAC + 1);
+  unsigned char *pPayload = (uint8_t *)(pSNAP + 1);
+  int PayloadLen = pPacket->RxFrameLength - (sizeof(struct IEEE80211QoSHeader) +
+                                         sizeof(struct SNAPHeader));
+  struct ethhdr EthHdr;
+
+  if (fp == NULL)
+  {
+    printf("Fail: Rx_WriteToLog NULL FILE pointer\n");
+    ErrCode = TX_ERR_NULLFILEPOINTER;
+    return ErrCode;
+  }
+
+  if (pBuf == NULL)
+  {
+    printf("Fail: Rx_WriteToLog NULL Buffer\n");
+    ErrCode = TX_ERR_NULLBUFFER;
+    return ErrCode;
+  }
+
+  // every now an then write a comment with column labels
+  if ((DumpHeadings) || (fp == stdout))
+  {
+    fprintf(fp, "%10s ", "#   SeqNum");
+    Rx_LLCHeader_fprintf(fp, NULL, 0, Latency);
+    EthHdr_fprintf(fp, NULL);
+    fprintf(fp, "%3s ", "Mat");
+    fprintf(fp, "%4s ", "Errs");
+    Payload_fprintf(fp, NULL, 0, 0); // last two args ingnored
+    fprintf(fp, "\n");
+  }
+  memcpy(EthHdr.h_source, pMAC->Address2, 6);
+  memcpy(EthHdr.h_dest, pMAC->Address1, 6);
+  EthHdr.h_proto = pSNAP->Type;
+
+  // SeqNum is first 4 Bytes of Payload
+  fprintf(fp, "%010d ", ntohl(*((uint32_t *) pPayload)));
+
+  // Tx Descriptor has its own dumper
+  Rx_LLCHeader_fprintf(fp, pPacket, ChannelNumber, Latency);
+  EthHdr_fprintf(fp, &EthHdr);
+
+  // Matched?
+  if (Matched)
+  {
+    fprintf(fp, "%3s ", "Yes");
+  }
+  else
+  {
+    fprintf(fp, "%3s ", "No");
+  }
+
+  // # Payload Byte Errors
+  fprintf(fp, "%04d ", PayloadErrors);
+
+  // Payload
+  Payload_fprintf(fp, pPayload, PayloadLen, DumpPayload);
+
+  fprintf(fp, "\n"); // end this packet line
+
+  return ErrCode;
+}
+
+static tRxErrCode Rx_fprintf (FILE * fp,
+                              unsigned char * pBuf,
+                              int FrameLen,
+                              unsigned char ChannelNumber,
+                              tInterfaceID InterfaceID,
+                              bool DumpPayload,
+                              bool Matched,
+                              bool DumpHeadings,
+                              int PayloadErrors,
+                              int Latency)
+{
+  tRxErrCode ErrCode = RX_ERR_NONE;
+  if (fp == NULL)
+    return ErrCode;
+
+  ErrCode = Rx_fprintf_waveraw(fp, pBuf, FrameLen, ChannelNumber, DumpPayload,
+                               Matched, DumpHeadings, PayloadErrors, Latency);
+  return ErrCode;
+}
+
+tMKxStatus LLC_RxInd (struct MKx *pMKx,
+                      tMKxRxPacket *pRxPkt,
+                      void *pPriv)
+{
+  int Res = MKXSTATUS_SUCCESS;
+  bool Matched;
+  uint8_t *pRxSrcAddr;
+  uint8_t ChannelNumber;
+  int PayloadLen; // Number of Bytes returned (and in Payload)
+  int NPaylodByteErrors;
+  struct MKxRxPacketData *pPacket;
+  struct IEEE80211QoSHeader *pMAC;
+  struct SNAPHeader *pSNAP;
+  uint8_t *pPayload;
+  int LatencyUsec = 0;
+  tMKxRadio RadioID;
+  tMKxChannel ChannelID;
+  struct PktBuf *pPkb = (struct PktBuf *)pPriv;
+  tRxStats *pRxStats = pDev->pRxStats;
+  tRxOpts * pRxOpts = &pDev->RxOpts;
+  const tMKxRadioConfigData *pRadio = pDev->pMKx->Config.Radio;
+  if (pRxPkt->Hdr.Type != MKXIF_RXPACKET)
+    goto Exit;
+  pPacket = &pRxPkt->RxPacketData;
+  if (pPacket->RxFrameLength < (sizeof(struct IEEE80211QoSHeader) +
+                                sizeof(struct SNAPHeader)) + 6)
+    // too short
+    goto Exit;
+  pMAC = (struct IEEE80211QoSHeader *)pPacket->RxFrame;
+  pSNAP = (struct SNAPHeader *)(pMAC + 1);
+  pPayload = (uint8_t *)(pSNAP + 1);
+  PayloadLen = pPacket->RxFrameLength - (sizeof(struct IEEE80211QoSHeader) +
+                                         sizeof(struct SNAPHeader));
+  d_printf(D_DEBUG, NULL, "pRxPkt %p type = %d\n", pRxPkt, pRxPkt->Hdr.Type);
+  d_printf(D_DEBUG, NULL, "Len = %d\n", pRxPkt->Hdr.Len);
+  d_printf(D_DEBUG, NULL, "FrameLen = %d\n", PayloadLen);
+  d_dump(D_DEBUG, NULL, pRxPkt, pRxPkt->Hdr.Len);
+  RadioID = pPacket->RadioID;
+  ChannelID = pPacket->ChannelID;
+  ChannelNumber = \
+    (pRadio[RadioID].ChanConfig[ChannelID].PHY.ChannelFreq - 5000)/5;
+  pRxSrcAddr = pMAC->Address2;
+  Matched = Rx_Match(pRxSrcAddr, ChannelNumber, pRxOpts);
+  if (Matched)
+  {
+    //myself
+    //*****************************
+    if (RxRecvLengthByte <= (0xffffffff - 4096))
+        RxRecvLengthByte += pPacket->RxFrameLength;
+    else
+        RxRecvLengthByte = 0;
+    //*****************************
+    // Number of Matched Frames increased
+    pRxStats->NMatched++;
+    d_printf(D_DEBUG, pDev, "Matched [%ld].\n", pRxStats->NMatched);
+    // Keep a running estimate of some statistics based on a continuous SeqNums
+    RxStats_Assess(pRxStats,
+                   ChannelNumber,
+                   pPacket,
+                   pPayload,
+                   PayloadLen,
+                   &NPaylodByteErrors);
+
+    // if keeping latency results (ie payload is type "Time" thus contains a Tx timestamp
+    if ( (pRxOpts->LatencyResults) && (pPayload[4] == PAYLOADMODE_TIME) )
+    {
+      struct timeval tv;
+      uint32_t *pPayload32 = (uint32_t*)pPayload;
+
+      // check that the packet is long enough for a latency test
+      if ( (PayloadLen - 4) < 16)
+      {
+        // cant do latency testing as payload is not large enough for a full timestamp
+      }
+      else
+      {
+        int sec, usec;
+        int sec_tx, usec_tx;
+        int n, HistIncr = 0;
+
+        // time now
+        gettimeofday(&tv, NULL);
+        sec = tv.tv_sec;
+        usec = tv.tv_usec;
+
+        // time when packet was transmitted in test-tx
+        sec_tx = pPayload32[2];
+        usec_tx = pPayload32[3];
+
+        LatencyUsec = 1000000 * (sec - sec_tx) + (usec - usec_tx);
+        d_printf(D_DEBUG, pDev, "latency: %d (%d,%d) -> (%d,%d)\n", LatencyUsec,
+                 sec_tx, usec_tx, sec, usec);
+
+        // update latency stats
+        pDev->pRxStats->TotalLatency += LatencyUsec;
+        if (LatencyUsec > pDev->pRxStats->MaxUsec)
+          pDev->pRxStats->MaxUsec = LatencyUsec;
+        if ( (LatencyUsec < pDev->pRxStats->MinUsec) || (pDev->pRxStats->MinUsec == 0) )
+          pDev->pRxStats->MinUsec = LatencyUsec;
+        if (pDev->pRxStats->NMatched > 0)
+          pDev->pRxStats->AvgUsec = pDev->pRxStats->TotalLatency / pDev->pRxStats->NMatched;
+        else
+          pDev->pRxStats->AvgUsec = 0;
+        d_printf(D_DEBUG, pDev, "LatencyUsec = %d, min = %d, max = %d, avg = %d\n",
+                 LatencyUsec, pDev->pRxStats->MinUsec, pDev->pRxStats->MaxUsec, 
+                 pDev->pRxStats->AvgUsec);
+
+        // update the latency histogram
+        // fill in the bins but not the last one which covers everything larger
+        // loop trough the bins but do not cover the last bin as its a special case
+        // which contains all the latencies larger.
+        for (n = 0; n < (RXSTATS_HIST_SIZE-1); n++)
+        {
+          // If the latency is less than the limit for this bin in the histogram increment
+          // the count for this bin and exit the loop, else keep looping through the
+          // bins in the histogram until we find a bin that the current latency fits
+          // into.
+          if (LatencyUsec < (HISTOGRAM_BIN_SIZE_USEC*(n+1)))
+          {
+            pDev->pRxStats->Hist[n]++;
+            HistIncr = 1;
+            break;
+          }
+        }
+        // if we didnt increment the histogram during the loop then the latency was larger
+        // than the limit for the second to last bin and so the last bin in the hostogram 
+        // which contains all larger latencies is incremented.
+        if (HistIncr == 0)
+          pDev->pRxStats->Hist[RXSTATS_HIST_SIZE-1]++;
+      }
+    }
+  }
+  else // !Matched
+  {
+    // Number of Unmatched Frames increased
+    pDev->pRxStats->NNotMatched++;
+    d_printf(D_INFO, pDev, "Not Matched [%ld].\n", pDev->pRxStats->NNotMatched);
+    NPaylodByteErrors = 0;
+  }
+  // Store the received event to file for off-line processing
+  if (Matched || ((Matched == false) && (pRxOpts->LogUnMatched)))
+  {
+    // every now & then dump a heading
+    bool DumpHeadings = (pDev->pRxStats->NMatched % 20) == 0;
+    Rx_fprintf(pDev->fp, (uint8_t *)pPacket, pDev->Cnt, ChannelNumber, 0,
+               pRxOpts->DumpPayload, Matched, DumpHeadings, NPaylodByteErrors,
+               LatencyUsec);
+    if (pRxOpts->DumpToStdout)
+    {
+      // also to stdout?
+      Rx_fprintf(stdout, (uint8_t *)pPacket, pDev->Cnt, ChannelNumber, 0,
+                 pRxOpts->DumpPayload, Matched, true, NPaylodByteErrors,
+                 LatencyUsec);
+    }
+  }
+
+  // Display outcome periodically
+  if ((pDev->Cnt % pRxOpts->ReportPeriod) == 0)
+  {
+//    RxStats_Report(stdout, pDev->pRxStats);
+//    RxStats_Report(pDev->fpr, pDev->pRxStats);
+  }
+
+  // Count number of unblocks
+  pDev->Cnt++;
+Exit:
+  PktBuf_Free(pPkb);
+  return Res;
+}
+
+/**
+ ** @brief Simple RxAlloc() implementation using pktbufs
+ **/
+tMKxStatus LLC_RxAlloc (struct MKx *pMKx,
+                        int BufLen,
+                        uint8_t **ppBuf,
+                        void **ppPriv)
+{
+  int Res = -ENOMEM;
+  int PkbLen = LLC_ALLOC_EXTRA_HEADER + BufLen + LLC_ALLOC_EXTRA_FOOTER;
+  struct PktBuf *pPkb = PktBuf_Alloc(PkbLen);
+  if (!pPkb)
+  {
+    goto Error;
+  }
+
+  // Pre-insert the data into the pPkb
+  PktBuf_Reserve(pPkb, LLC_ALLOC_EXTRA_HEADER);
+  PktBuf_Put(pPkb, BufLen);
+
+  *ppBuf = (uint8_t *)(pPkb->data);
+  *ppPriv = (uint8_t *)pPkb;
+  Res = 0;
+Error:
+  d_printf(D_DEBUG, NULL, "BufLen %d *ppBuf %p *ppPriv %p\n",
+           BufLen, *ppBuf, *ppPriv);
+  return Res;
+}
+
+/**
+ * @brief Initiate the 'dbg' command
+ */
+int LLC_RxInit (struct LLCRx *pDev)
+{
+  int Res;
+  tRxOpts * pRxOpts = &pDev->RxOpts;
+
+  d_fnstart(D_TST, NULL, "()\n");
+
+  // setup the signal handlers to exit gracefully
+  d_printf(D_DBG, NULL, "Signal handlers\n");
+  signal(SIGINT,  LLC_RxSignal);
+  signal(SIGTERM, LLC_RxSignal);
+  signal(SIGQUIT, LLC_RxSignal);
+  signal(SIGHUP,  LLC_RxSignal);
+  signal(SIGPIPE, LLC_RxSignal);
+
+  // Create the Stats object
+  Res = RxStats_new(&pDev->pRxStats);
+  if (pDev->pRxStats == NULL)
+  {
+    d_printf(D_ERR, NULL, "Fail: malloc() errno %d\n", errno);
+    goto Error;
+  }
+  Res = MKx_Init(&(pDev->pMKx));
+  if (Res < 0)
+    goto Error;
+  pDev->Fd = MKx_Fd(pDev->pMKx);
+  if (pDev->Fd < 0)
+    goto Error;
+
+  Res = RxOpts_New(pDev->Args.Argc, pDev->Args.ppArgv, pRxOpts);
+  if (Res)
+    goto Error;
+
+  RxOpts_Print(pRxOpts);
+
+  // PreLoad the Ethernet Header (used in RAW frames)
+//  memcpy(pDev->EthHdr.h_source, pDev->RxOpts.SrcAddr, ETH_ALEN); // SA
+
+  // Open a handle for the packet log file
+  if (pRxOpts->pPacketLogFileName[0] != 0)
+  {
+    pDev->fp = fopen(pRxOpts->pPacketLogFileName, "w");
+    if (pDev->fp == NULL)
+    {
+      printf("Fail: fopen(%s) errno %d\n", pRxOpts->pPacketLogFileName, errno);
+    }
+    else
+    {
+      d_printf(D_INFO, pDev, "Opened %s for logging (Handle %p)\n",
+               pRxOpts->pPacketLogFileName, pDev->fp);
+    }
+  }
+
+  // Open a handle for the Report file
+  pDev->fpr = fopen(pRxOpts->pReportFileName, "w");
+  if (pDev->fpr == NULL)
+  {
+    printf("Fail: fopen(%s) errno %d\n", pRxOpts->pReportFileName, errno);
+    goto Error;
+  }
+  else
+  {
+    d_printf(D_INFO, pDev, "Opened %s for Reporting (Handle %p)\n",
+             pRxOpts->pReportFileName, pDev->fpr);
+
+  }
+
+  pDev->RxContinue = true;
+
+  pDev->pMKx->API.Callbacks.RxInd = LLC_RxInd;
+  pDev->pMKx->API.Callbacks.RxAlloc = LLC_RxAlloc;
+  pDev->pMKx->pPriv = (void *)pDev;
+
+Error:
+  if (Res != 0)
+    LLC_RxUsage();
+
+  d_fnend(D_TST, NULL, "() = %d\n", Res);
+  return Res;
+}
+
+/**
+ * @brief Cancel any 'dbg' command(s)
+ */
+int LLC_RxExit (struct LLCRx *pDev)
+{
+  int Res = -ENOSYS;
+
+  d_fnstart(D_TST, NULL, "()\n");
+  d_assert(pDev != NULL);
+
+  // Break the MKx_Recv() loops
+  (void)MKx_Recv(NULL);
+
+  if (pDev->pMKx != NULL)
+    MKx_Exit(pDev->pMKx);
+  Res = 0;
+
+  // Close any open packet log file
+  if (pDev->fp != NULL)
+  {
+    fflush(pDev->fp);
+    d_printf(D_INFO, pDev, "Closing logging File Handle %p.\n", pDev->fp);
+    fclose(pDev->fp);
+    pDev->fp = NULL;
+  }
+
+  // Close any open Report file
+  if (pDev->fpr != NULL)
+  {
+
+    // last chance report
+//    RxStats_Report(pDev->fpr, pDev->pRxStats);
+    fflush(pDev->fpr);
+
+    d_printf(D_INFO, pDev, "Closing logging File Handle %p.\n", pDev->fpr);
+    fclose(pDev->fpr);
+    pDev->fpr = NULL;
+  }
+
+  //free(pDev->pRxPacket);
+  // Free the RxStats object
+  if (pDev->pRxStats != NULL)
+  {
+    RxStats_free(pDev->pRxStats);
+    pDev->pRxStats = NULL;
+  }
+
+  d_fnend(D_TST, NULL, "() = %d\n", Res);
+  return Res;
+}
+
+/**
+ * @brief Application entry point
+ * @param argc Number of command line arguments
+ * @param argv Array of command line arguments
+ * @return Zero if successful, otherwise a negative errno
+ *
+ * Main application
+ * - Initialise data variables
+ * - Parse user option command line variables
+ * - Initialise interfaces
+ * - Use poll() to wait for some input from interfaces
+ * - Perform actions on each input action
+ * - De-initialise interfaces when Exit condition met
+ *
+ */
+static int LLC_RxMain (int Argc, char **ppArgv)
+{
+  int Res;
+  tRxOpts *pRxOpts;
+  // setup the poll events
+  const int POLL_INPUT = (POLLIN | POLLPRI);
+  const int POLL_ERROR = (POLLERR | POLLHUP | POLLNVAL);
+  struct pollfd Fds[1] = { {-1, } };
+  time_t LastRx = time(NULL);
+
+  //myself
+  time_t LastSecond = time(NULL);
+  RxRecvLengthByte = 0;
+  LastRxRecvLengthByte = 0;  
+
+  d_fnstart(D_TST, NULL, "()\n");
+
+  pDev->Args.Argc = Argc;
+  pDev->Args.ppArgv = ppArgv;
+
+  // Initial actions
+  Res = LLC_RxInit(pDev);
+  if (Res < 0)
+    goto Error;
+
+  Fds[0].fd = pDev->Fd;
+  Fds[0].events = POLL_INPUT;
+
+  pRxOpts = &pDev->RxOpts;
+  (void)pRxOpts;
+  while (pDev->RxContinue)
+  {
+    Res = poll(Fds, 1, 3000);
+    if (Res < 0)
+    {
+      d_printf(D_WARN, NULL, "Poll error %d '%s'\n", errno, strerror(errno));
+      pDev->RxContinue = false;
+    }
+    else if (Res == 0)
+    {
+      // this poll will usually NOT timeout since we get stats events etc via the
+      // LLC when the radio is active - so instead to get stats printed every 3
+      // seconds whilst we are not actively receiving packets, we do it around the
+      // MKx_Recv() call below
+      d_printf(D_INFO, NULL, "Poll timeout\n");
+//      RxStats_Report(stdout, pDev->pRxStats);
+      continue;
+    }
+
+    if (Fds[0].revents & POLL_ERROR)
+    {
+      d_error(D_ERR, NULL, "Poll error on MKX (revents 0x%02x)\n",
+              Fds[0].revents);
+    }
+
+    if (Fds[0].revents & POLL_INPUT)
+    {
+      int Cnt = pDev->Cnt;
+      Res = MKx_Recv(pDev->pMKx);
+      time_t Now = time(NULL);
+      if (Now - LastRx >= 3)
+      {
+//        RxStats_Report(stdout, pDev->pRxStats);
+        LastRx = time(NULL);
+      }
+      else if (pDev->Cnt != Cnt)
+      {
+        LastRx = time(NULL);
+      }
+    }
+  //myself
+    time_t Nowing = time(NULL);
+    if(Nowing - LastSecond >= 1)
+    {
+	printf("transform data rate : %lf kB/s \n", (RxRecvLengthByte - LastRxRecvLengthByte) / 1000.0);
+	LastSecond = time(NULL);
+	LastRxRecvLengthByte = RxRecvLengthByte;	
+    }
+  }
+//  RxStats_Report(stdout, pDev->pRxStats);
+//  RxStats_Report(pDev->fpr, pDev->pRxStats);
+
+Error:
+  // Final actions
+  LLC_RxExit(pDev);
+
+  d_fnend(D_TST, NULL, "() = %d\n", Res);
+  return Res;
+}
+
+/**
+ * @}
+ */
